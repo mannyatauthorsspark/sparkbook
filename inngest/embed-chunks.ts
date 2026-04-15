@@ -3,12 +3,10 @@
  *
  * Triggered by: chunks/embed.requested
  * Flow per transcript:
- *   1. Read raw text from R2
- *   2. Split into ~512-token chunks (2000 chars) with 64-token overlap (256 chars)
- *      — breaks at sentence boundaries where possible
- *   3. Batch embed chunks via OpenRouter (text-embedding-3-small, 20 per call)
- *   4. Insert chunk rows + vector embeddings into Neon
- * On completion: set project status = 'ready'
+ *   1. Read raw text from R2 + split into chunks (one step)
+ *   2. Embed + insert each batch of 20 chunks (one step per batch)
+ *      — keeps each Vercel invocation small, avoids OOM on Hobby plan
+ *   3. Set project status = 'ready'
  */
 
 import { inngest } from './client'
@@ -18,7 +16,7 @@ import { sql } from '@/lib/neon'
 
 const CHUNK_CHARS = 2000    // ≈ 512 tokens (1 token ≈ 4 chars)
 const OVERLAP_CHARS = 256   // ≈ 64 tokens overlap
-const EMBED_BATCH = 20      // texts per OpenRouter embeddings call
+const EMBED_BATCH = 10      // reduced from 20 to keep memory low per step
 
 export const embedChunks = inngest.createFunction(
   {
@@ -51,17 +49,23 @@ export const embedChunks = inngest.createFunction(
       return { transcripts: 0, chunks: 0 }
     }
 
-    // ── 2. Chunk + embed each transcript ────────────────────────────────────
     let totalChunks = 0
 
     for (const transcript of transcripts) {
-      const count = await step.run(`chunk-embed-${transcript.id}`, async () => {
+      // ── 2. Read + chunk the transcript (one small step) ───────────────────
+      const chunks = await step.run(`chunk-${transcript.id}`, async () => {
         const text = await getFromR2(BUCKETS.transcripts, transcript.r2_key)
-        const chunks = chunkText(text)
+        return chunkText(text)
+      })
 
-        // Embed in batches of EMBED_BATCH
-        for (let i = 0; i < chunks.length; i += EMBED_BATCH) {
-          const batch = chunks.slice(i, i + EMBED_BATCH)
+      totalChunks += chunks.length
+
+      // ── 3. Embed + insert one batch per step ─────────────────────────────
+      for (let i = 0; i < chunks.length; i += EMBED_BATCH) {
+        const batch = chunks.slice(i, i + EMBED_BATCH)
+        const batchIndex = Math.floor(i / EMBED_BATCH)
+
+        await step.run(`embed-insert-${transcript.id}-batch-${batchIndex}`, async () => {
           const embeddings = await embedTexts(batch.map((c) => c.text))
 
           for (let j = 0; j < batch.length; j++) {
@@ -82,15 +86,11 @@ export const embedChunks = inngest.createFunction(
               )
             `
           }
-        }
-
-        return chunks.length
-      })
-
-      totalChunks += count
+        })
+      }
     }
 
-    // ── 3. Advance project to 'ready' ────────────────────────────────────────
+    // ── 4. Advance project to 'ready' ────────────────────────────────────────
     await step.run('mark-project-ready', async () => {
       await sql`UPDATE projects SET status = 'ready' WHERE id = ${projectId}`
     })
@@ -107,10 +107,6 @@ interface TextChunk {
   tokenCount: number
 }
 
-/**
- * Split text into overlapping chunks, preferring sentence boundaries.
- * Rough token estimate: 1 token ≈ 4 characters.
- */
 function chunkText(text: string): TextChunk[] {
   const chunks: TextChunk[] = []
   let start = 0
@@ -119,7 +115,6 @@ function chunkText(text: string): TextChunk[] {
     const end = Math.min(start + CHUNK_CHARS, text.length)
     let chunkEnd = end
 
-    // Prefer to break at a sentence boundary (. or newline) in the back half
     if (end < text.length) {
       const lastPeriod = text.lastIndexOf('.', end)
       const lastNewline = text.lastIndexOf('\n', end)
