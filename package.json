@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "dev:inngest": "node --env-file=.env.local node_modules/.bin/tsx scripts/inngest-server.ts",
     "build": "next build",
     "start": "next start"
   },
@@ -30,6 +31,7 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "tailwindcss": "^4",
+    "tsx": "^4.21.0",
     "typescript": "^5"
   }
 }
