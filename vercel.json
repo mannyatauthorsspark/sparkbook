@@ -1,5 +1,11 @@
 {
   "framework": "nextjs",
   "buildCommand": "npm run build",
-  "installCommand": "npm install"
+  "installCommand": "npm install",
+  "functions": {
+    "app/api/inngest/route.ts": {
+      "memory": 3008,
+      "maxDuration": 300
+    }
+  }
 }
