@@ -9,8 +9,6 @@ const PORT = 3001
 const handler = serve({
   client: inngest,
   functions: [ingestYoutube, embedChunks],
-  serveHost: `http://localhost:${PORT}`,
-  servePath: '/api/inngest',
 })
 
 http.createServer(handler).listen(PORT, () => {
