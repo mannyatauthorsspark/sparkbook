@@ -2,11 +2,12 @@
  * Inngest function: chunking + embedding pipeline
  *
  * Triggered by: chunks/embed.requested
- * Flow per transcript:
- *   1. Read raw text from R2 + split into chunks (one step)
- *   2. Embed + insert each batch of 20 chunks (one step per batch)
- *      — keeps each Vercel invocation small, avoids OOM on Hobby plan
+ * Flow:
+ *   1. For each transcript: read R2, chunk, INSERT all rows with embedding = NULL
+ *   2. Loop: SELECT 10 unembedded chunks → embed → UPDATE — repeat until done
  *   3. Set project status = 'ready'
+ *
+ * No large arrays passed through Inngest state — each step is small and safe on Hobby plan.
  */
 
 import { inngest } from './client'
@@ -14,9 +15,9 @@ import { getFromR2, BUCKETS } from '@/lib/r2'
 import { embedTexts, toVectorLiteral } from '@/lib/embeddings'
 import { sql } from '@/lib/neon'
 
-const CHUNK_CHARS = 2000    // ≈ 512 tokens (1 token ≈ 4 chars)
-const OVERLAP_CHARS = 256   // ≈ 64 tokens overlap
-const EMBED_BATCH = 10      // reduced from 20 to keep memory low per step
+const CHUNK_CHARS = 2000
+const OVERLAP_CHARS = 256
+const EMBED_BATCH = 10
 
 export const embedChunks = inngest.createFunction(
   {
@@ -49,53 +50,68 @@ export const embedChunks = inngest.createFunction(
       return { transcripts: 0, chunks: 0 }
     }
 
-    let totalChunks = 0
-
+    // ── 2. Chunk each transcript → write to DB without embeddings ────────────
     for (const transcript of transcripts) {
-      // ── 2. Read + chunk the transcript (one small step) ───────────────────
-      const chunks = await step.run(`chunk-${transcript.id}`, async () => {
+      await step.run(`chunk-${transcript.id}`, async () => {
         const text = await getFromR2(BUCKETS.transcripts, transcript.r2_key)
-        return chunkText(text)
+        const chunks = chunkText(text)
+
+        for (const chunk of chunks) {
+          await sql`
+            INSERT INTO chunks (
+              transcript_id, project_id, content,
+              token_count, chunk_offset,
+              source_type, source_confidence
+            ) VALUES (
+              ${transcript.id}, ${projectId}, ${chunk.text},
+              ${chunk.tokenCount}, ${chunk.offset},
+              ${transcript.source_type}, ${transcript.source_confidence}
+            )
+          `
+        }
+
+        return chunks.length
       })
-
-      totalChunks += chunks.length
-
-      // ── 3. Embed + insert one batch per step ─────────────────────────────
-      for (let i = 0; i < chunks.length; i += EMBED_BATCH) {
-        const batch = chunks.slice(i, i + EMBED_BATCH)
-        const batchIndex = Math.floor(i / EMBED_BATCH)
-
-        await step.run(`embed-insert-${transcript.id}-batch-${batchIndex}`, async () => {
-          const embeddings = await embedTexts(batch.map((c) => c.text))
-
-          for (let j = 0; j < batch.length; j++) {
-            const chunk = batch[j]
-            const vector = toVectorLiteral(embeddings[j])
-
-            await sql`
-              INSERT INTO chunks (
-                transcript_id, project_id, content,
-                token_count, chunk_offset,
-                source_type, source_confidence,
-                embedding
-              ) VALUES (
-                ${transcript.id}, ${projectId}, ${chunk.text},
-                ${chunk.tokenCount}, ${chunk.offset},
-                ${transcript.source_type}, ${transcript.source_confidence},
-                ${vector}::vector
-              )
-            `
-          }
-        })
-      }
     }
 
-    // ── 4. Advance project to 'ready' ────────────────────────────────────────
+    // ── 3. Embed in DB-driven batches (no large arrays in Inngest state) ─────
+    let batchIndex = 0
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const done = await step.run(`embed-batch-${batchIndex}`, async () => {
+        const rows = (await sql`
+          SELECT id, content
+          FROM chunks
+          WHERE project_id = ${projectId}
+            AND embedding IS NULL
+          LIMIT ${EMBED_BATCH}
+        `) as { id: string; content: string }[]
+
+        if (rows.length === 0) return true
+
+        const embeddings = await embedTexts(rows.map((r) => r.content))
+
+        for (let i = 0; i < rows.length; i++) {
+          const vector = toVectorLiteral(embeddings[i])
+          await sql`
+            UPDATE chunks SET embedding = ${vector}::vector
+            WHERE id = ${rows[i].id}
+          `
+        }
+
+        return false
+      })
+
+      if (done) break
+      batchIndex++
+    }
+
+    // ── 4. Mark project ready ────────────────────────────────────────────────
     await step.run('mark-project-ready', async () => {
       await sql`UPDATE projects SET status = 'ready' WHERE id = ${projectId}`
     })
 
-    return { transcripts: transcripts.length, chunks: totalChunks }
+    return { transcripts: transcripts.length }
   }
 )
 
